@@ -1,0 +1,30 @@
+.venv/
+.state/
+*.app/
+__pycache__/
+*.pyc
+.DS_Store
+artifacts/*
+!artifacts/.gitkeep
+
+# Local operational instructions and machine-specific acceptance records.
+/AGENTS.md
+/deploy/macos/*.md
+
+# Private configuration, databases, keys, and local build artifacts.
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.dmg
+*.zip
+*.tar.gz

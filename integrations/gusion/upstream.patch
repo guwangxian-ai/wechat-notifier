@@ -1,0 +1,249 @@
+--- a/bridge/script.js
++++ b/bridge/script.js
+@@ -381,8 +381,9 @@
+     if (r3ModeActive) {
+         console.log("[+] R3 原生发送模式: 跳过 req2buf/blrX8/StartTask/slot13-capture 等发送 hook");
+         // 语音上传依赖 uploadVoiceX1/uploadFunc*；这些只做内存初始化，不注册发送 hook。
+-        setImmediate(setupSendImgMessageDynamic);
+         setImmediate(r3Init);
++        setImmediate(contactSetupHooks);
++        return; // Notification-only: text R3 + approved group directory; no incoming/media hooks.
+     } else {
+         setImmediate(setupSendTextMessageDynamic);
+         setImmediate(setupSendFileMessageDynamic);
+@@ -3731,6 +3732,34 @@
+     }
+ }
+ 
++// SPDX-License-Identifier: GPL-3.0-or-later
++// macOS arm64e.x1 uses PACIBSPPC (0xdac1a7fe). Keep that instruction at
++// its original PC so the CPU signs LR normally. Only entry callbacks are
++// supported after it; an onLeave callback could replace that signed LR.
++// Validated on Mac mini: all four CommonCrypto APIs returned success with
++// real calls using synthetic zero-value inputs. No protection is disabled.
++function contactAttach(address, callbacks) {
++    try {
++        var site = address;
++        if (Process.arch === "arm64") {
++            var entry = address.strip();
++            if (entry.readU32() === 0xdac1a7fe) {
++                if (typeof callbacks.onLeave === "function") {
++                    throw new Error("PACIBSPPC onLeave is unsupported");
++                }
++                site = entry.add(4);
++                Instruction.parse(site);
++            }
++        }
++        Interceptor.attach(site, callbacks);
++        contactState.hookCount = (contactState.hookCount || 0) + 1;
++        return true;
++    } catch (e) {
++        contactState.lastError = String(e);
++        return false;
++    }
++}
++
+ function contactSetupHooks() {
+     if (contactState.installed) return;
+     if (!contactDirectoryEnabled) {
+@@ -3758,7 +3787,7 @@
+         var createMode = contactFindExport("CCCryptorCreateWithMode");
+         var crypt = contactFindExport("CCCrypt");
+         if (create) {
+-            Interceptor.attach(create, {
++            contactAttach(create, {
+                 onEnter: function (args) {
+                     try {
+                         var alg = args[1].toInt32();
+@@ -3769,7 +3798,7 @@
+             });
+         }
+         if (createMode) {
+-            Interceptor.attach(createMode, {
++            contactAttach(createMode, {
+                 onEnter: function (args) {
+                     try {
+                         if (args[2].toInt32() !== 0) return; // kCCAlgorithmAES
+@@ -3779,7 +3808,7 @@
+             });
+         }
+         if (crypt) {
+-            Interceptor.attach(crypt, {
++            contactAttach(crypt, {
+                 onEnter: function (args) {
+                     try {
+                         if (args[1].toInt32() !== 0) return; // kCCAlgorithmAES
+@@ -3790,7 +3819,7 @@
+         }
+         if (pbkdf2) {
+             // 登录期：rounds=256000 输出 32 字节 → passphrase 与 enc_key。
+-            Interceptor.attach(pbkdf2, {
++            contactAttach(pbkdf2, {
+                 onEnter: function (args) {
+                     try {
+                         if (contactState.inCrypto) return;
+@@ -3807,9 +3836,11 @@
+                 }
+             });
+         }
+-        contactState.installed = true;
++        contactState.installed = (contactState.hookCount || 0) > 0;
++        if (!contactState.installed) return;
+         console.log("[+] [contact] 通讯录 Hook 已安装（AES key + PBKDF2 passphrase 捕获）");
+     } catch (e) {
++        contactState.lastError = String(e);
+         console.log("[!] [contact] Hook 安装失败: " + e);
+     }
+ }
+@@ -4204,7 +4235,7 @@
+     var db = null;
+     try {
+         db = SqliteDatabase.open(dbPath);
+-        var stmt = db.prepare("SELECT username, nick_name, remark, alias, delete_flag FROM contact;");
++        var stmt = db.prepare("SELECT username, nick_name, remark, alias, delete_flag FROM contact WHERE username LIKE '%@chatroom';");
+         var row = stmt.step();
+         while (row && count < CONTACT_MAX_ENTRIES) {
+             var username = row[0] ? String(row[0]) : "";
+@@ -4226,7 +4257,7 @@
+             row = stmt.step();
+         }
+         // 群昵称：同一个人在群里的显示名可能与通讯录不同，群聊优先用群昵称。
+-        var roomStmt = db.prepare("SELECT username, hex(ext_buffer) FROM chat_room WHERE username IS NOT NULL;");
++        var roomStmt = db.prepare("SELECT username, '' FROM chat_room WHERE 0;");
+         var roomRow = roomStmt.step();
+         var roomCount = 0;
+         while (roomRow && roomCount < CONTACT_MAX_ENTRIES) {
+@@ -4347,6 +4378,10 @@
+     try {
+         return JSON.stringify({
+             installed: contactState.installed,
++            file_api: typeof File !== "undefined",
++            sqlite_api: typeof SqliteDatabase !== "undefined",
++            crypto_api: !!contactFindExport("CCCrypt"),
++            setup_error: contactState.lastError ? (String(contactState.lastError).indexOf("unable to intercept") !== -1 ? "hook_attach_failed" : "runtime_error") : "",
+             validated: Object.keys(contactState.keysBySalt).length,
+             candidates: contactState.candidates.length,
+             passphrase: !!contactState.passphraseHex,
+--- a/bridge/main.go
++++ b/bridge/main.go
+@@ -6,7 +6,6 @@
+ 	"flag"
+ 	"fmt"
+ 	"net/http"
+-	_ "net/http/pprof"
+ 	"os"
+ 	"os/signal"
+ 	"runtime/debug"
+@@ -42,6 +41,9 @@
+ 	go SendWorker()
+ 	go cleanExpiredDownloads()
+ 
++	if os.Getenv("WECHAT_NOTIFIER_ONLY") == "1" {
++		registerNotifierRoutes()
++	} else {
+ 	http.HandleFunc("/send_private_msg", sendHandler)
+ 	http.HandleFunc("/send_group_msg", sendHandler)
+ 	http.HandleFunc("/fetch_image", fetchImageHandler)
+@@ -51,6 +53,7 @@
+ 
+ 	http.HandleFunc("/ws", handleWebSocket)
+ 	http.HandleFunc("/test_ws", testWebSocket)
++	}
+ 
+ 	stop := make(chan os.Signal, 1)
+ 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+@@ -75,7 +78,7 @@
+ 
+ 	// 3. 启动服务
+ 	Info("HTTP 服务启动在", "host", config.ReceiveHost)
+-	if err := http.ListenAndServe(config.ReceiveHost, nil); err != nil {
++	if err := (&http.Server{Addr: config.ReceiveHost, ReadHeaderTimeout: 5*time.Second, ReadTimeout: 10*time.Second, WriteTimeout: 35*time.Second, IdleTimeout: 30*time.Second, MaxHeaderBytes: 16384}).ListenAndServe(); err != nil {
+ 		Error("服务启动失败", "err", err)
+ 	}
+ 
+@@ -99,6 +102,7 @@
+ 	flag.StringVar(&logLevel, "log_level", "info", "log level")
+ 
+ 	flag.Parse()
++	if token := os.Getenv("WECHAT_NOTIFIER_TOKEN"); token != "" { config.OnebotToken = token }
+ 
+ 	if selfIDFlag != "" {
+ 		myWechatId = selfIDFlag
+@@ -120,7 +124,7 @@
+ 	fmt.Println("SendURL", config.SendURL)
+ 	fmt.Println("ReceiveHost", config.ReceiveHost)
+ 	fmt.Println("FridaGadgetAddr", config.FridaGadgetAddr)
+-	fmt.Println("OnebotToken", config.OnebotToken)
++	fmt.Println("OnebotToken", "[redacted]")
+ 	fmt.Println("ImagePath", config.ImagePath)
+ 	fmt.Println("MediaDir", config.MediaDir)
+ 	fmt.Println("WechatConf", config.WechatConf)
+@@ -134,7 +138,9 @@
+ 	var err error
+ 	mgr := frida.NewDeviceManager()
+ 	// 连接到 Gadget 默认端口
+-	device, err = mgr.AddRemoteDevice(config.FridaGadgetAddr, frida.NewRemoteDeviceOptions())
++	remoteOptions := frida.NewRemoteDeviceOptions()
++	if token := os.Getenv("WECHAT_NOTIFIER_GADGET_TOKEN"); token != "" { remoteOptions.SetToken(token) }
++	device, err = mgr.AddRemoteDevice(config.FridaGadgetAddr, remoteOptions)
+ 	if err != nil {
+ 		Fatal("❌ 无法连接 Gadget", err)
+ 	}
+@@ -241,6 +247,12 @@
+ 		}
+ 
+ 		msgType := str(msg, "type")
++		if os.Getenv("WECHAT_NOTIFIER_ONLY") == "1" {
++			if msgType != "send" { return }
++			if p, ok := msg["payload"].(map[string]interface{}); ok {
++				switch str(p,"type") { case "r3_seed", "r3_mode": default: return }
++			} else { return }
++		}
+ 
+ 		switch msgType {
+ 		case "send":
+@@ -417,7 +429,7 @@
+ 	// 通讯录 DB key：回灌上次缓存的密钥，hook 可直接解密 contact.db，不必等
+ 	// 用户重新打开一次通讯录触发页读。密钥只在内存/Frida 间传递，不打印；
+ 	// 无缓存或失败只记日志，不影响启动。
+-	restoreContactDBKeys()
++	if os.Getenv("WECHAT_NOTIFIER_DIRECTORY") == "1" { restoreContactDBKeys() }
+ 
+ 	// 4.1.15.55 R3：bridge 重启但微信未重启时，恢复上次捕获的发送句柄，避免回复排队。
+ 	// gadget 模式拿不到微信 PID，由 JS 用 Process.id 做新鲜度校验。
+--- a/bridge/r3seed.go
++++ b/bridge/r3seed.go
+@@ -47,6 +47,10 @@
+ }
+ 
+ func r3SeedFile() string {
++	if base := os.Getenv("WECHAT_NOTIFIER_CACHE_DIR"); base != "" {
++		_ = os.MkdirAll(base, 0o700)
++		return filepath.Join(base,"r3-seed.json")
++	}
+ 	dir, err := os.UserCacheDir()
+ 	if err != nil || dir == "" {
+ 		dir = os.TempDir()
+--- a/bridge/contact.go
++++ b/bridge/contact.go
+@@ -341,6 +341,7 @@
+ 
+ // defaultContactDBKeysFilePath 返回 db-keys.json 默认路径：与 r3-seed.json 同目录。
+ func defaultContactDBKeysFilePath() string {
++	if base := os.Getenv("WECHAT_NOTIFIER_CACHE_DIR"); base != "" { return filepath.Join(base,"db-keys.json") }
+ 	dir, err := os.UserCacheDir()
+ 	if err != nil || dir == "" {
+ 		dir = os.TempDir()
+--- a/bridge/logger.go
++++ b/bridge/logger.go
+@@ -46,8 +46,8 @@
+ 	}
+ 	fileWriter := &lumberjack.Logger{
+ 		Filename:   logFilePath,
+-		MaxSize:    100,
+-		MaxBackups: 10,
++		MaxSize:    2,
++		MaxBackups: 2,
+ 		MaxAge:     30,
+ 		Compress:   false,
+ 	}

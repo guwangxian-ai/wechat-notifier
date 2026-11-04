@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>个人微信群通知</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">跳到主要内容</a>
+<section id="auth-gate" class="auth-gate" hidden>
+  <form id="auth-form" class="auth-box">
+    <div class="brand-mark">群</div><h1>打开通知台</h1>
+    <p>使用本机管理密钥连接，或双击应用目录里的“打开通知台.command”。</p>
+    <label for="admin-key">管理密钥</label>
+    <input id="admin-key" type="password" required autocomplete="off" spellcheck="false">
+    <p id="auth-error" class="field-error" role="alert"></p>
+    <button type="submit" class="primary">连接通知台</button>
+  </form>
+</section>
+<div id="app" class="app-shell" hidden>
+  <aside class="sidebar">
+    <a href="#tasks" class="brand"><span class="brand-mark">群</span><span>微信群通知<small>个人微信 · Mac</small></span></a>
+    <nav aria-label="主要导航">
+      <a href="#tasks" data-page="tasks"><span class="nav-symbol">▤</span>通知任务</a>
+      <a href="#targets" data-page="targets"><span class="nav-symbol">▦</span>目标群</a>
+      <a href="#settings" data-page="settings"><span class="nav-symbol">⌘</span>连接与接口</a>
+    </nav>
+    <div class="sidebar-bottom"><span class="status-dot" id="sidebar-dot"></span><span id="sidebar-state">正在连接</span><small>队列独立保存，关闭页面不影响服务</small></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <div><h1 id="page-title">通知任务</h1><p id="page-description">查看通知队列与发送结果</p></div>
+      <div class="topbar-actions"><span class="badge" id="dispatch-state">发送已暂停</span><button id="toggle-dispatch" class="secondary" type="button">开启发送</button></div>
+    </header>
+    <main id="main" tabindex="-1">
+      <div id="rehearsal-banner" class="notice warning" hidden>当前为预演模式。任务只验证流程，不搜索或发送微信；预演完成不会记作真实发送。</div>
+      <div id="connection-banner" class="notice" hidden><span id="connection-text"></span><a href="#settings">查看连接设置 →</a></div>
+      <div id="global-error" class="notice error" role="alert" hidden></div>
+      <section id="page-tasks" class="page">
+        <div class="queue-summary" aria-label="队列统计"><span><b id="count-pending">0</b> 待处理</span><span><b id="count-submitted">0</b> 已提交微信</span><span><b id="count-observed">0</b> 已核对</span><span><b id="count-attention">0</b> 需要核对</span><span class="summary-note" id="queue-note">默认只接收，开启后按顺序发送</span></div>
+        <div class="section-tools"><label class="compact-label" for="task-filter">任务状态<select id="task-filter"><option value="">全部任务</option><option value="pending">待发送</option><option value="submitted">已提交微信</option><option value="observed">本地已确认</option><option value="confirmed_manually">人工已确认</option><option value="unknown">结果未知</option><option value="failed">执行失败</option><option value="simulated">预演完成</option><option value="cancelled">已取消</option><option value="expired">已过期</option></select></label><button id="compose-open" class="primary" type="button">＋ 写通知</button></div>
+        <div id="tasks-loading" class="loading" role="status">正在读取任务…</div>
+        <div id="tasks-empty" class="empty" hidden><div class="empty-mark" aria-hidden="true">▤</div><h2 id="empty-title">通知会在这里排队</h2><p id="empty-description">先绑定一个微信群，再提交第一条通知。之后也可以通过接口接收采集端线索。</p><a class="button secondary" id="empty-action" href="#targets">绑定目标群</a></div>
+        <div id="tasks-table-wrap" class="table-wrap" hidden><table><thead><tr><th>通知内容</th><th>目标群</th><th>状态</th><th>提交时间</th><th><span class="sr-only">操作</span></th></tr></thead><tbody id="tasks-body"></tbody></table></div>
+        <div class="pagination" id="pagination" hidden><span id="page-info"></span><div><button id="previous-page" type="button" class="text-button">上一页</button><button id="next-page" type="button" class="text-button">下一页</button></div></div>
+        <p class="footnote">“已提交微信”表示原生发送任务已提交，未验证群端送达；“本地已确认”表示已在本机界面核对。结果未知时暂停队列，可到群内搜索通知编号。</p>
+      </section>
+      <section id="page-targets" class="page" hidden>
+        <section class="surface search-surface"><h2>绑定通知群</h2><p id="target-instructions">从微信本机群目录查找，选择后核对群名和唯一群 ID。绑定过程不操作聊天输入框。</p>
+          <form id="search-form"><label for="group-query">群名或群备注</label><div class="input-action"><input id="group-query" required maxlength="100" placeholder="输入目标微信群的名称" autocomplete="off"><button type="submit" class="primary">查找群聊</button></div><p class="field-error" id="search-error" role="alert"></p></form>
+          <div id="search-results" hidden><p class="small-label">找到的群聊 · 请选择并核对</p><div id="candidate-list"></div></div>
+        </section>
+        <div class="section-heading"><h2>已绑定的群</h2><span id="targets-count" class="muted"></span></div>
+        <div id="targets-list"></div><p id="targets-empty" class="plain-empty">尚未绑定目标群。绑定完成后，可在通知表单和接口中选择它。</p>
+      </section>
+      <section id="page-settings" class="page" hidden>
+        <div class="settings-grid"><section class="surface"><div class="surface-heading"><h2>微信后台连接</h2><button id="check-connection" class="text-button" type="button">重新检查</button></div><p id="wechat-version" class="muted"></p><div id="connection-checks"></div><p id="execution-note" class="footnote"></p><button id="check-background" class="secondary" type="button">后台连接检查（不发送）</button><p id="background-result" class="field-error" role="status" hidden></p><p id="permission-note" class="footnote" hidden></p></section>
+          <section class="surface"><h2>发送节奏</h2><form id="settings-form"><label for="interval-seconds">两次发送至少间隔（秒）</label><input id="interval-seconds" type="number" min="5" max="3600" required><label for="max-pending">最多待处理任务数</label><input id="max-pending" type="number" min="1" max="5000" required><p class="footnote">新任务默认 24 小时过期。超过队列上限会明确拒绝，调用方可稍后重试。</p><p id="settings-error" class="field-error" role="alert"></p><button class="secondary" type="submit">保存设置</button></form></section></div>
+        <details class="surface api-surface" id="native-connection-settings"><summary>原生发送桥连接设置</summary><form id="native-connection-form"><label for="bridge-url">本机发送桥地址</label><input id="bridge-url" type="url" required value="http://127.0.0.1:58080"><label for="bridge-token">发送桥密钥</label><input id="bridge-token" type="password" maxlength="256" autocomplete="off" placeholder="已配置时，留空保留现有密钥"><p class="footnote">部署时会自动配置。更换连接后发送暂停，重新核对目标群和连接状态再开启。</p><p id="bridge-config-error" class="field-error" role="alert"></p><button type="submit" class="secondary">保存发送桥连接</button></form></details>
+        <section class="surface api-surface"><div class="surface-heading"><h2>给其他应用调用</h2><span class="badge">Bearer Token</span></div><p>采集端只需提交事件编号、目标群标识和通知内容。相同事件重复提交不会创建重复任务。</p><div class="endpoint"><span>POST</span><code id="api-endpoint"></code></div><pre id="api-example"></pre><div class="token-tools"><button id="reveal-token" class="secondary" type="button">显示接口密钥</button><div id="token-field" class="input-action" hidden><input id="ingest-token" type="password" readonly aria-label="接口密钥"><button id="copy-token" type="button" class="secondary">复制密钥</button></div></div><p class="footnote">接口密钥可提交任务、查询自己提交的任务，不能管理群或开启发送。服务只监听本机；远程访问使用 SSH 转发。</p></section>
+      </section>
+    </main>
+  </div>
+</div>
+<dialog id="compose-dialog"><form id="compose-form"><div class="dialog-heading"><h2>写通知</h2><button class="close-dialog" type="button" aria-label="关闭写通知">×</button></div><label for="compose-target">发送到</label><select id="compose-target" required><option value="">请先绑定目标群</option></select><label for="compose-title">标题 <span class="optional">选填</span></label><input id="compose-title" maxlength="120" placeholder="例如：新增装修需求线索"><label for="compose-body">通知内容</label><textarea id="compose-body" rows="7" maxlength="4000" required placeholder="填写用户、地区、需求原话及来源链接"></textarea><div class="form-meta"><span>消息末尾会附上唯一通知编号，便于核对。</span><span id="body-count">0 / 4000</span></div><label for="compose-event">事件编号</label><input id="compose-event" required maxlength="160" pattern="[A-Za-z0-9_.:@/\-]+" spellcheck="false"><p class="footnote">手动通知自动生成；接口调用时建议使用稳定的线索事件编号。</p><p id="compose-error" class="field-error" role="alert"></p><div class="dialog-footer"><span id="compose-hint">加入队列后，开启发送才会执行。</span><button class="primary" type="submit">加入通知队列</button></div></form></dialog>
+<dialog id="bind-dialog"><form id="bind-form"><div class="dialog-heading"><h2>核对目标群</h2><button class="close-dialog" type="button" aria-label="关闭群绑定">×</button></div><p class="selected-group" id="bind-group-name"></p><p id="bind-group-id" class="footnote" hidden></p><figure id="bind-preview" hidden><img id="bind-title-image" alt="微信当前群标题的本地预览"></figure><p id="bind-calibration-note" class="footnote" hidden>请核对预览中的群名与特殊符号，并确认输入框无需要保留的草稿。绑定时会写入并清除一段校验草稿，不发送消息。</p><label for="bind-label">显示名称</label><input id="bind-label" required maxlength="60"><label for="bind-code">接口使用的群标识</label><input id="bind-code" required pattern="[a-z][a-z0-9_-]{1,39}" maxlength="40" spellcheck="false"><p class="footnote">使用小写字母、数字、下划线或短横线。保存后不会替换已有任务的接收群。</p><label class="checkbox"><input id="bind-confirm" type="checkbox" required>我已核对，这是要接收通知的微信群</label><p id="bind-error" class="field-error" role="alert"></p><div class="dialog-footer"><span id="bind-save-note">保存时会再次核对群 ID 和账号</span><button class="primary" type="submit">确认绑定</button></div></form></dialog>
+<dialog id="task-dialog"><div class="dialog-heading"><h2>通知详情</h2><button class="close-dialog" type="button" aria-label="关闭通知详情">×</button></div><div id="task-detail"></div><div class="dialog-footer" id="task-actions"></div><p id="task-error" class="field-error" role="alert"></p></dialog>
+<dialog id="enable-dialog"><form id="enable-form"><div class="dialog-heading"><h2 id="enable-title">开启自动发送</h2><button class="close-dialog" type="button" aria-label="关闭发送确认">×</button></div><p id="enable-description">开启后，队列中的有效任务会按顺序发送到各自绑定的群。请确认微信登录状态、目标群和消息内容。</p><p id="enable-error" class="field-error" role="alert"></p><div class="dialog-footer"><span>可以随时暂停，未发送任务会保留</span><button type="submit" class="primary">确认开启</button></div></form></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

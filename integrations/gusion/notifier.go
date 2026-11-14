@@ -27,10 +27,12 @@ const notifierCommit = "9094de7859618a8124f9d3162e63c87b0c8c837a"
 
 var notifierSession = uuid.NewString()
 var notifierGroupID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}@chatroom$`)
+var notifierUserID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 var notifierRequestID = regexp.MustCompile(`^[a-f0-9]{32}$`)
 var notifierVersions = map[string]string{"4.1.15.55": "270135", "4.2.0.5": "270341", "4.2.0.9": "270345", "4.2.0.12": "270348"}
 var notifierStatusReader = notifierCurrentStatus
 var notifierDirectoryReader = refreshContactDirectory
+var notifierContactsReader = notifierReadContacts
 var notifierKeyStatusReader = func() (map[string]any, error) {
 	result, err := callFridaExport("getDbKeyStatus")
 	if err != nil {
@@ -61,6 +63,7 @@ var notifierEnqueue = func(message *SendMsg) error {
 func registerNotifierRoutes() {
 	http.HandleFunc("/notifier/status", notifierStatusHandler)
 	http.HandleFunc("/notifier/groups", notifierGroupsHandler)
+	http.HandleFunc("/notifier/contacts", notifierContactsHandler)
 	http.HandleFunc("/notifier/submit", notifierSubmitHandler)
 }
 
@@ -166,7 +169,7 @@ func notifierCurrentStatus() (map[string]any, error) {
 	return map[string]any{"protocol": notifierProtocol, "upstream_commit": notifierCommit,
 		"version": conf["notifierVersion"], "build": conf["notifierBuild"], "session_id": notifierSession,
 		"account_id": myWechatId, "ready": ready, "seeded": seeded,
-		"directory_enabled": conf["contactDirectory"] == "true"}, nil
+		"directory_enabled": conf["contactDirectory"] == "true", "private_send_enabled": true}, nil
 }
 
 func notifierStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -223,9 +226,101 @@ func notifierGroupsHandler(w http.ResponseWriter, r *http.Request) {
 		"account_id": state["account_id"], "session_id": state["session_id"], "groups": groups}})
 }
 
+func notifierValidUserID(id string) bool {
+	return notifierUserID.MatchString(id) && !strings.HasPrefix(strings.ToLower(id), "gh_")
+}
+
+type notifierContact struct {
+	UserID      string `json:"user_id"`
+	DisplayName string `json:"display_name"`
+}
+
+func notifierReadContacts(query string, exact bool) ([]notifierContact, error) {
+	if !contactDirectoryRefreshMu.TryLock() {
+		return nil, errors.New("directory_busy")
+	}
+	defer contactDirectoryRefreshMu.Unlock()
+
+	path := deriveDBStoragePath(config.ImagePath)
+	if path == "" {
+		return nil, errContactPathUnknown
+	}
+	result, err := callFridaExport("getContactDirectory", path, query, exact)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := contactRPCResultString(result)
+	if err != nil {
+		return nil, err
+	}
+	var reply struct {
+		OK       bool              `json:"ok"`
+		Contacts []notifierContact `json:"contacts"`
+	}
+	if json.Unmarshal([]byte(raw), &reply) != nil || !reply.OK || reply.Contacts == nil {
+		return nil, errors.New("contact_lookup_failed")
+	}
+	return reply.Contacts, nil
+}
+
+func notifierContactsHandler(w http.ResponseWriter, r *http.Request) {
+	if !notifierAuthorized(w, r, http.MethodPost) {
+		return
+	}
+	var request struct {
+		Query              string `json:"query"`
+		Exact              bool   `json:"exact"`
+		AllowContactLookup bool   `json:"allow_contact_lookup"`
+		AccountID          string `json:"account_id"`
+		SessionID          string `json:"session_id"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2048))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&request) != nil || !request.AllowContactLookup ||
+		strings.TrimSpace(request.Query) == "" || utf8.RuneCountInString(request.Query) > 128 ||
+		strings.ContainsAny(request.Query, "\x00\r\n") ||
+		(request.Exact && !notifierValidUserID(request.Query)) {
+		notifierFailure(w, 400)
+		return
+	}
+	state, err := notifierStatusReader()
+	if err != nil || state["directory_enabled"] != true {
+		notifierFailure(w, 503)
+		return
+	}
+	if request.AccountID == "" || request.SessionID == "" ||
+		state["account_id"] != request.AccountID || state["session_id"] != request.SessionID {
+		notifierFailure(w, 409)
+		return
+	}
+	contacts, err := notifierContactsReader(request.Query, request.Exact)
+	if err != nil || contacts == nil || len(contacts) > 20 {
+		notifierFailure(w, 503)
+		return
+	}
+	seen := make(map[string]bool, len(contacts))
+	for _, contact := range contacts {
+		if !notifierValidUserID(contact.UserID) || seen[contact.UserID] ||
+			(request.Exact && contact.UserID != request.Query) ||
+			strings.TrimSpace(contact.DisplayName) == "" || utf8.RuneCountInString(contact.DisplayName) > 200 {
+			notifierFailure(w, 503)
+			return
+		}
+		seen[contact.UserID] = true
+	}
+	after, err := notifierStatusReader()
+	if err != nil || after["account_id"] != request.AccountID || after["session_id"] != request.SessionID {
+		notifierFailure(w, 409)
+		return
+	}
+	notifierJSON(w, 200, map[string]any{"status": "ok", "data": map[string]any{
+		"account_id": request.AccountID, "session_id": request.SessionID, "contacts": contacts}})
+}
+
 type notifierSubmission struct {
 	RequestID string `json:"request_id"`
 	GroupID   string `json:"group_id"`
+	UserID    string `json:"user_id"`
 	AccountID string `json:"account_id"`
 	SessionID string `json:"session_id"`
 	Text      string `json:"text"`
@@ -249,8 +344,13 @@ func notifierSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	var request notifierSubmission
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&request) != nil || !notifierRequestID.MatchString(request.RequestID) ||
-		!notifierGroupID.MatchString(request.GroupID) || strings.TrimSpace(request.Text) == "" ||
+	if decoder.Decode(&request) != nil {
+		notifierFailure(w, 400)
+		return
+	}
+	group := request.UserID == "" && notifierGroupID.MatchString(request.GroupID)
+	private := request.GroupID == "" && notifierValidUserID(request.UserID)
+	if !notifierRequestID.MatchString(request.RequestID) || (!group && !private) || strings.TrimSpace(request.Text) == "" ||
 		!utf8.ValidString(request.Text) || utf8.RuneCountInString(request.Text) > 5000 {
 		notifierFailure(w, 400)
 		return
@@ -304,7 +404,8 @@ func notifierSubmitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	notifierReceipts.Unlock()
 	if !exists {
-		err = notifierEnqueue(&SendMsg{GroupID: request.GroupID, Content: request.Text, Type: "text", ResultChan: make(chan error, 1)})
+		err = notifierEnqueue(&SendMsg{GroupID: request.GroupID, UserId: request.UserID,
+			Content: request.Text, Type: "text", ResultChan: make(chan error, 1)})
 		entry.submitted = err == nil
 		close(entry.done)
 	} else {

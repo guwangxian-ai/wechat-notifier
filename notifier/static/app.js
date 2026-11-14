@@ -2,7 +2,7 @@
 const $ = selector => document.querySelector(selector);
 const state = {token:sessionStorage.getItem('wn-key') || '', page:'tasks', taskPage:1, status:null, targets:[], candidate:null, task:null, busy:false, timer:null};
 const labels = {pending:'待发送',preparing:'正在核对',dispatching:'正在发送',observed:'本地已确认',submitted:'已提交微信',unknown:'结果未知',failed:'执行失败',cancelled:'已取消',expired:'已过期',simulated:'预演完成',confirmed_manually:'人工已确认'};
-const descriptions = {tasks:['通知任务','查看通知队列与发送结果'],targets:['目标群','绑定并核对接收通知的个人微信群'],settings:['连接与接口','检查微信连接，配置发送节奏与调用接口']};
+const descriptions = {tasks:['通知任务','查看通知队列与发送结果'],targets:['通知目标','绑定接收通知的微信群聊或联系人'],settings:['连接与接口','检查微信连接，配置发送节奏与调用接口']};
 function node(tag, text, className) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(className) el.className=className; return el; }
 function timeLabel(seconds) { return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(seconds*1000)); }
 function badge(status) { const color=['observed','confirmed_manually'].includes(status)?'green':['unknown','failed'].includes(status)?'red':['pending','preparing','dispatching'].includes(status)?'yellow':''; return node('span',labels[status]||status,'badge '+color); }
@@ -23,7 +23,7 @@ function setPage(name) {
   for(const key of Object.keys(descriptions)) $('#page-'+key).hidden=key!==name;
   document.querySelectorAll('[data-page]').forEach(a=>{if(a.dataset.page===name)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');});
   $('#page-title').textContent=descriptions[name][0]; $('#page-description').textContent=descriptions[name][1];
-  document.title=descriptions[name][0]+' · 微信群通知';
+  document.title=descriptions[name][0]+' · 微信通知';
 }
 function renderStatus(data) {
   state.status=data; const rehearsal=data.connection.mode==='dry_run',enabled=data.settings.dispatch_enabled;
@@ -45,16 +45,50 @@ function renderStatus(data) {
   const checks=$('#connection-checks'); checks.replaceChildren();
   for(const check of data.connection.checks){const row=node('div',undefined,'check-row'); row.append(node('span',check.ok?'✓':'○','check-status '+(check.ok?'ok':'')));const text=node('div');text.append(node('strong',check.name),node('p',check.detail));row.append(text);if(!rehearsal&&!check.ok&&['辅助功能','屏幕录制'].includes(check.name)){const button=node('button','在 Mac mini 打开设置','text-button');button.type='button';button.onclick=()=>withButton(button,async()=>{await post('/permissions/'+(check.name==='辅助功能'?'accessibility':'screen'));toast('请在 Mac mini 的系统设置中确认授权');});row.append(button);}checks.append(row);}
   if(!state.settingsDirty){$('#interval-seconds').value=data.settings.interval_seconds;$('#max-pending').value=data.settings.max_pending;}
-  $('#compose-hint').textContent=enabled?(rehearsal?'提交后执行预演，不发送微信。':'提交后将自动发送，请核对目标群。'):'加入队列后，开启发送才会执行。';
+  $('#compose-hint').textContent=enabled?(rehearsal?'提交后执行预演，不发送微信。':'提交后将自动发送，请核对收件人。'):'加入队列后，开启发送才会执行。';
+}
+function recipientIdentity(item) {
+  if(item.user_id) return ['微信 ID',item.user_id];
+  if(item.group_id) return ['群 ID',item.group_id];
+  return null;
 }
 function renderTargets() {
   const container=$('#targets-list');container.replaceChildren();
   const active=state.targets.filter(t=>t.active&&t.mode===state.status?.connection.mode&&t.backend===(state.status?.connection.backend||'visual'));
   $('#targets-count').textContent=active.length+' 个可用';$('#targets-empty').hidden=state.targets.length>0;
-  for(const target of state.targets){const row=node('div',undefined,'group-row'); row.append(node('span','群','group-avatar'));const info=node('div',undefined,'group-info');info.append(node('strong',target.label));const line=node('p',target.group_name+' · ');line.append(node('code',target.code));info.append(line);if(target.group_id)info.append(node('p',target.group_id,'footnote'));const targetBadge=node('span',target.active?(target.mode==='dry_run'?'预演绑定':target.backend==='onebot'?'群 ID 已绑定':'旧窗口绑定'):'已停用','badge '+(target.active?'green':''));row.append(info,targetBadge);if(target.active){const button=node('button','停用','text-button');button.type='button';button.addEventListener('click',async()=>{if(!confirm('停用此群后，尚未发送的任务会取消。确定停用？'))return;await withButton(button,async()=>{await post('/targets/'+encodeURIComponent(target.code)+'/disable');await refresh();toast('目标群已停用');});});row.append(button);}container.append(row);}
+  for(const target of state.targets){
+    const row=node('div',undefined,'group-row'),info=node('div',undefined,'group-info');
+    const kind=target.user_id?'个人':'群聊';
+    row.append(node('span',kind[0],'group-avatar'));
+    info.append(node('strong',target.label));
+    const line=node('p',target.group_name+' · ');
+    line.append(node('code',target.code));
+    info.append(line);
+    const identity=recipientIdentity(target);
+    if(identity) info.append(node('p',identity.join(' · '),'footnote'));
+    const status=target.active ? (target.mode==='dry_run'?'预演绑定':kind) : '已停用';
+    row.append(info,node('span',status,'badge '+(target.active?'green':'')));
+    if(target.active){
+      const button=node('button','停用','text-button');
+      button.type='button';
+      button.onclick=()=>withButton(button,async()=>{
+        if(!confirm('停用此目标后，待发送任务会取消。确定停用？')) return;
+        await post('/targets/'+encodeURIComponent(target.code)+'/disable');
+        await refresh();
+        toast('通知目标已停用');
+      });
+      row.append(button);
+    }
+    container.append(row);
+  }
   const select=$('#compose-target'),current=select.value;select.replaceChildren();
-  if(!active.length){const option=node('option','请先绑定目标群');option.value='';select.append(option);}
-  else for(const target of active){const option=node('option',target.label+' · '+target.group_name);option.value=target.code;select.append(option);}
+  if(active.length!==1){const option=node('option',active.length?'请选择收件人':'请先绑定通知目标');option.value='';select.append(option);}
+  for(const target of active){
+    const label=target.label===target.group_name?target.label:target.label+' · '+target.group_name;
+    const option=node('option',(target.user_id?'个人 · ':'群聊 · ')+label);
+    option.value=target.code;
+    select.append(option);
+  }
   if(active.some(t=>t.code===current))select.value=current;
 }
 async function renderTasks() {
@@ -64,7 +98,7 @@ async function renderTasks() {
   $('#tasks-loading').hidden=true;$('#tasks-empty').hidden=data.items.length>0;$('#tasks-table-wrap').hidden=!data.items.length;
   const filtered=Boolean($('#task-filter').value),hasTargets=state.targets.some(t=>t.active&&t.mode===state.status?.connection.mode&&t.backend===(state.status?.connection.backend||'visual'));
   $('#empty-title').textContent=filtered?'这个状态下还没有任务':'通知会在这里排队';
-  $('#empty-description').textContent=filtered?'可以切换筛选条件查看其他通知。':hasTargets?'目标群已绑定，可以写一条通知加入队列，也可以等待其他应用提交。':'先绑定一个微信群，再提交第一条通知。之后也可以通过接口接收采集端线索。';
+  $('#empty-description').textContent=filtered?'可以切换筛选条件查看其他通知。':hasTargets?'可以写一条通知加入队列，也可以等待其他应用提交。':'先绑定一个群聊或联系人，再提交第一条通知。';
   $('#empty-action').hidden=filtered||hasTargets;
   const count=data.counts;$('#count-pending').textContent=(count.pending||0)+(count.preparing||0)+(count.dispatching||0);$('#count-submitted').textContent=count.submitted||0;$('#count-observed').textContent=(count.observed||0)+(count.confirmed_manually||0);$('#count-attention').textContent=(count.unknown||0)+(count.failed||0);
   const body=$('#tasks-body');
@@ -88,16 +122,21 @@ async function openTask(id) {
 }
 function renderDetail() {
   const task=state.task,container=$('#task-detail');container.replaceChildren(badge(task.status));
-  const details=node('dl',undefined,'detail-meta');for(const [name,value] of [['目标群',task.group_name],...(task.group_id?[['群 ID',task.group_id]]:[]),['事件编号',task.event_id],['提交时间',timeLabel(task.created_at)],['有效期至',timeLabel(task.expires_at)]])details.append(node('dt',name),node('dd',value));container.append(details,node('div',task.message,'detail-message'));
+  const details=node('dl',undefined,'detail-meta'),identity=recipientIdentity(task);
+  const metadata=[[task.user_id?'个人收件人':'目标群',task.group_name]];
+  if(identity) metadata.push(identity);
+  metadata.push(['事件编号',task.event_id],['提交时间',timeLabel(task.created_at)],['有效期至',timeLabel(task.expires_at)]);
+  for(const [name,value] of metadata) details.append(node('dt',name),node('dd',value));
+  container.append(details,node('div',task.message,'detail-message'));
   if(task.error_message)container.append(node('p',task.error_message,'detail-warning'));
-  if(task.status==='submitted')container.append(node('p','原生发送桥已提交任务。请到群内搜索通知编号，核对后可标记为人工已确认。','detail-warning'));
-  if(task.status==='unknown')container.append(node('p','请在微信群中搜索这条通知的编号。确认已发送可标记“人工已确认”；只有核对未发送后才能重试。','detail-warning'));
+  if(task.status==='submitted')container.append(node('p','请在对应微信会话搜索通知编号，核对后可标记为人工已确认。','detail-warning'));
+  if(task.status==='unknown')container.append(node('p','请在对应微信会话搜索通知编号。确认未发送后可以重试。','detail-warning'));
   const timeline=node('div',undefined,'timeline');for(const event of task.events){const row=node('div',undefined,'timeline-row');row.append(node('span',labels[event.status]||event.status),node('span',timeLabel(event.at)));timeline.append(row);}container.append(timeline);
   const actions=$('#task-actions');actions.replaceChildren();
   async function action(button,name,payload={}){await withButton(button,async()=>{state.task=await post('/tasks/'+task.id+'/'+name,payload);renderDetail();await refresh();toast('任务状态已更新');},'#task-error');}
   if(['pending','failed','unknown'].includes(task.status)){const button=node('button','取消任务','secondary');button.type='button';button.onclick=()=>action(button,'cancel');actions.append(button);}
-  if(['unknown','submitted'].includes(task.status)){const confirmButton=node('button','已在群里确认发送','secondary');confirmButton.type='button';confirmButton.onclick=()=>{if(confirm('确认已在微信群里找到相同通知编号的消息？'))action(confirmButton,'confirm');};actions.append(confirmButton);}
-  if(['failed','unknown'].includes(task.status)){const retry=node('button',task.status==='unknown'?'核对未发送后重试':'重新排队','primary');retry.type='button';retry.onclick=()=>{if(task.status==='unknown'&&!confirm('请先在微信群里搜索通知编号。确认尚未发送才可重试，避免重复通知。你已核对未发送？'))return;action(retry,'retry',{checked_not_sent:task.status==='unknown'});};actions.append(retry);}
+  if(['unknown','submitted'].includes(task.status)){const confirmButton=node('button','已核对送达','secondary');confirmButton.type='button';confirmButton.onclick=()=>{if(confirm('确认已在对应会话找到这条通知？'))action(confirmButton,'confirm');};actions.append(confirmButton);}
+  if(['failed','unknown'].includes(task.status)){const retry=node('button',task.status==='unknown'?'核对未发送后重试':'重新排队','primary');retry.type='button';retry.onclick=()=>{if(task.status==='unknown'&&!confirm('确认已在对应会话核对通知编号，消息尚未发送？'))return;action(retry,'retry',{checked_not_sent:task.status==='unknown'});};actions.append(retry);}
 }
 $('#auth-form').addEventListener('submit',async event=>{event.preventDefault();state.token=$('#admin-key').value.trim();await withButton(event.submitter,async()=>{await request('/status');sessionStorage.setItem('wn-key',state.token);$('#admin-key').value='';showApp();setPage(pageFromHash());await refresh();},'#auth-error');});
 window.addEventListener('hashchange',()=>{setPage(pageFromHash());refresh();});
@@ -109,9 +148,85 @@ window.addEventListener('popstate',()=>{restoreTaskLocation();setPage(pageFromHa
 $('#compose-open').onclick=()=>{$('#compose-form').reset();renderTargets();$('#compose-event').value='manual:'+crypto.randomUUID();$('#body-count').textContent='0 / 4000';$('#compose-error').textContent='';$('#compose-dialog').showModal();$('#compose-target').focus();};
 $('#compose-body').oninput=()=>$('#body-count').textContent=$('#compose-body').value.length+' / 4000';
 $('#compose-form').addEventListener('submit',async event=>{event.preventDefault();await withButton(event.submitter,async()=>{const response=await post('/notifications',{event_id:$('#compose-event').value.trim(),target_code:$('#compose-target').value,title:$('#compose-title').value,body:$('#compose-body').value});$('#compose-dialog').close();$('#compose-form').reset();toast(response.duplicate?'已存在相同通知，未重复创建':'通知已加入队列');state.taskPage=1;if(state.page!=='tasks')location.hash='tasks';await refresh();},'#compose-error');});
-function chooseCandidate(item){state.candidate=item;$('#bind-form').reset();$('#bind-group-name').textContent=item.group_name;$('#bind-preview').hidden=!item.preview;$('#bind-title-image').src=item.preview||'';$('#bind-calibration-note').hidden=!item.requires_visual_confirmation;$('#bind-group-id').hidden=!item.group_id;$('#bind-group-id').textContent=item.group_id?'唯一群 ID：'+item.group_id:'';$('#bind-save-note').textContent=item.group_id?'保存时会再次核对群 ID 和账号':'保存时会再次打开并核对群标题';$('#bind-label').value=item.group_name;$('#bind-code').value='leads-'+crypto.randomUUID().slice(0,6);$('#bind-error').textContent='';$('#bind-dialog').showModal();}
-$('#search-form').addEventListener('submit',async event=>{event.preventDefault();$('#search-error').textContent='';$('#search-results').hidden=true;await withButton(event.submitter,async()=>{const data=await post('/targets/search',{query:$('#group-query').value.trim()});const list=$('#candidate-list');list.replaceChildren();for(const item of data.items){const row=node('div',undefined,'candidate-row'),text=node('div');text.append(node('strong',item.group_name),node('small',state.status.connection.mode==='dry_run'?'预演候选，不代表真实微信中的群':(item.selection_source==='native_directory'?'群 ID：'+item.group_id:item.selection_source==='window_title'?'已核对微信当前群标题':'来自微信本地群聊搜索')));const button=node('button','选择此群','secondary');button.type='button';button.onclick=()=>chooseCandidate(item);row.append(text,button);list.append(row);}$('#search-results').hidden=false;if(state.openCandidateOnSearch&&data.items.length===1)chooseCandidate(data.items[0]);state.openCandidateOnSearch=false;},'#search-error');});
-$('#bind-form').addEventListener('submit',async event=>{event.preventDefault();await withButton(event.submitter,async()=>{await post('/targets/bind',{candidate_id:state.candidate.candidate_id,code:$('#bind-code').value.trim(),label:$('#bind-label').value.trim(),confirmed_visual:$('#bind-confirm').checked});$('#bind-dialog').close();$('#search-results').hidden=true;await refresh();toast('目标群已绑定');},'#bind-error');});
+function chooseCandidate(item) {
+  state.candidate=item;
+  const identity=recipientIdentity(item),rehearsal=state.status?.connection.mode==='dry_run';
+  $('#bind-form').reset();
+  $('#bind-heading').textContent=item.user_id?'核对个人收件人':'核对目标群';
+  $('#bind-group-name').textContent=item.group_name;
+  $('#bind-preview').hidden=!item.preview;
+  if(item.preview) $('#bind-title-image').src=item.preview;
+  else $('#bind-title-image').removeAttribute('src');
+  $('#bind-calibration-note').hidden=!item.requires_visual_confirmation;
+  $('#bind-recipient-id').hidden=!identity;
+  $('#bind-recipient-id').textContent=identity?.join(' · ')||'';
+  $('#bind-confirm-label').textContent=item.user_id?'我已核对接收通知的联系人':'我已核对接收通知的微信群';
+  $('#bind-save-note').textContent=rehearsal?'保存预演收件人':identity?'保存时会再次核对 ID 和账号':'保存时会再次核对群标题';
+  $('#bind-label').value=item.group_name.slice(0,60);
+  $('#bind-code').value=(item.user_id?'person-':'leads-')+crypto.randomUUID().slice(0,6);
+  $('#bind-error').textContent='';
+  $('#bind-dialog').showModal();
+}
+
+function clearSearchResults() {
+  $('#search-error').textContent='';
+  $('#search-results').hidden=true;
+  $('#candidate-list').replaceChildren();
+}
+
+$('#recipient-type').addEventListener('change',()=>{
+  const personal=$('#recipient-type').value==='private';
+  $('#search-label').textContent=personal?'昵称、备注或微信 ID':'群名或群 ID';
+  $('#group-query').placeholder=personal?'例如 文件传输助手':'输入目标微信群的名称';
+  $('#search-submit').textContent=personal?'查找联系人':'查找群聊';
+  $('#private-lookup').hidden=!personal;
+  $('#allow-contact-lookup').checked=false;
+  clearSearchResults();
+});
+$('#group-query').addEventListener('input',clearSearchResults);
+$('#search-form').addEventListener('submit',async event=>{
+  event.preventDefault();
+  const type=$('#recipient-type'),input=$('#group-query'),consent=$('#allow-contact-lookup');
+  const recipientType=type.value,query=input.value.trim(),openCandidate=state.openCandidateOnSearch;
+  const allowLookup=recipientType==='private'&&consent.checked;
+  state.openCandidateOnSearch=false;
+  consent.checked=false;
+  clearSearchResults();
+  type.disabled=input.disabled=consent.disabled=true;
+  try {
+    await withButton(event.submitter,async()=>{
+      const data=await post('/targets/search',{query,recipient_type:recipientType,allow_contact_lookup:allowLookup});
+      const list=$('#candidate-list'),rehearsal=state.status?.connection.mode==='dry_run';
+      for(const item of data.items){
+        const row=node('div',undefined,'candidate-row'),info=node('div'),identity=recipientIdentity(item);
+        info.append(node('strong',item.group_name));
+        const detail=rehearsal?'预演候选':identity?.join(' · ')||'来自微信本地群聊搜索';
+        info.append(node('small',detail));
+        const button=node('button',item.user_id?'选择联系人':'选择此群','secondary');
+        button.type='button';
+        button.onclick=()=>chooseCandidate(item);
+        row.append(info,button);
+        list.append(row);
+      }
+      $('#search-result-label').textContent=data.items.length?'选择收件人并核对身份':'未找到匹配的收件人';
+      $('#search-results').hidden=false;
+      if(openCandidate&&data.items.length===1) chooseCandidate(data.items[0]);
+    },'#search-error');
+  } finally {
+    type.disabled=input.disabled=consent.disabled=false;
+  }
+});
+$('#bind-form').addEventListener('submit',async event=>{
+  event.preventDefault();
+  await withButton(event.submitter,async()=>{
+    await post('/targets/bind',{candidate_id:state.candidate.candidate_id,code:$('#bind-code').value.trim(),
+      label:$('#bind-label').value.trim(),confirmed_visual:$('#bind-confirm').checked});
+    $('#bind-dialog').close();
+    clearSearchResults();
+    await refresh();
+    toast('收件人已绑定');
+  },'#bind-error');
+});
 $('#toggle-dispatch').onclick=async event=>{if(state.status?.settings.dispatch_enabled){await withButton(event.target,async()=>{await request('/settings',{method:'PATCH',body:JSON.stringify({dispatch_enabled:false})});await refresh();toast('已暂停，未发送任务会保留');});}else{$('#enable-error').textContent='';$('#enable-title').textContent=state.status?.connection.mode==='dry_run'?'开启队列预演':'开启自动发送';$('#enable-dialog').showModal();}};
 $('#enable-form').addEventListener('submit',async event=>{event.preventDefault();await withButton(event.submitter,async()=>{await request('/settings',{method:'PATCH',body:JSON.stringify({dispatch_enabled:true})});$('#enable-dialog').close();await refresh();toast('队列执行已开启');},'#enable-error');});
 $('#native-connection-settings').addEventListener('toggle',async event=>{if(!event.target.open||state.bridgeDirty)return;try{const data=await request('/native/connection');$('#bridge-url').value=data.base_url;$('#bridge-token').placeholder=data.has_token?'已配置，留空保留现有密钥':'留空自动生成本机密钥';}catch(error){fieldError('#bridge-config-error',error);}});
@@ -127,7 +242,7 @@ document.querySelectorAll('.close-dialog').forEach(button=>button.onclick=()=>{c
 $('#compose-dialog').addEventListener('cancel',event=>{if($('#compose-body').value&&!confirm('通知尚未加入队列，确定关闭？'))event.preventDefault();});
 window.addEventListener('beforeunload',event=>{if(($('#compose-dialog').open&&$('#compose-body').value)||state.settingsDirty||state.bridgeDirty){event.preventDefault();event.returnValue='';}});
 $('#api-endpoint').textContent=location.origin+'/api/v1/notifications';
-$('#api-example').textContent=JSON.stringify({event_id:'lead:platform:user:created',target_code:'绑定群时设置的标识',title:'新增线索',body:'用户、地区、需求原话与来源链接',expires_in_seconds:86400},null,2)+'\n\n返回 task_id 后查询 GET /api/v1/tasks/{task_id}；202 表示已入队。';
+$('#api-example').textContent=JSON.stringify({event_id:'lead:platform:user:created',target_code:'绑定时设置的目标标识',title:'新增线索',body:'用户、地区、需求原话与来源链接',expires_in_seconds:86400},null,2)+'\n\n返回 task_id 后查询 GET /api/v1/tasks/{task_id}；202 表示已入队。';
 const params=new URLSearchParams(location.hash.slice(1)),requestedGroup=params.get('group');if(params.has('key')){state.token=params.get('key');sessionStorage.setItem('wn-key',state.token);history.replaceState(null,'',location.pathname+(requestedGroup?'#targets':'#tasks'));}
 restoreTaskLocation();setPage(pageFromHash());if(state.token){showApp();refresh().then(()=>{if(requestedGroup){$('#group-query').value=requestedGroup;state.openCandidateOnSearch=true;$('#search-form').requestSubmit($('#search-form button[type=submit]'));}});}else showGate();
 setInterval(()=>{if(!document.hidden&&!document.querySelector('dialog[open]')&&!$('#app').hidden)refresh();},10000);

@@ -13,11 +13,18 @@ ADAPTER = ROOT / 'integrations/gusion'
 PATCHES = {
     'bridge/script.js': [
         ('        setImmediate(setupSendImgMessageDynamic);\n        setImmediate(r3Init);',
-         '        setImmediate(r3Init);\n        setImmediate(contactSetupHooks);\n        return; // Notification-only: text R3 + approved group directory; no incoming/media hooks.'),
+         '        setImmediate(r3Init);\n        setImmediate(contactSetupHooks);\n        return; // Notification-only: text R3 + local target lookup; no incoming/media hooks.'),
         ('SELECT username, nick_name, remark, alias, delete_flag FROM contact;',
          "SELECT username, nick_name, remark, alias, delete_flag FROM contact WHERE username LIKE '%@chatroom';"),
         ('SELECT username, hex(ext_buffer) FROM chat_room WHERE username IS NOT NULL;',
          "SELECT username, '' FROM chat_room WHERE 0;"),
+        ('function getContactDirectory(dbStoragePath) {',
+         (ADAPTER / 'private_contacts.js').read_text() + '\nfunction getContactDirectory(dbStoragePath, query, exact) {'),
+        ('            directory = contactQueryDirectory(tmpPath);',
+         '            if (typeof query === "string") {\n'
+         '                return JSON.stringify({ ok: true, contacts: contactQueryPeople(tmpPath, query, exact) });\n'
+         '            }\n'
+         '            directory = contactQueryDirectory(tmpPath);'),
         ('        console.log("[!] [contact] Hook 安装失败: " + e);',
          '        contactState.lastError = String(e);\n        console.log("[!] [contact] Hook 安装失败: " + e);'),
         ('function contactSetupHooks() {',

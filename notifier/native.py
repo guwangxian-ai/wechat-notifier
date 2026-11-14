@@ -18,7 +18,13 @@ SUPPORTED = {'4.1.15.55': '270135', '4.2.0.5': '270341',
              '4.2.0.9': '270345', '4.2.0.12': '270348'}
 PROTOCOL = 'wechat-notifier-gusion-v1'
 GROUP_ID = re.compile(r'^[A-Za-z0-9_-]{1,128}@chatroom$')
+USER_ID = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+FILE_HELPER = {'user_id': 'filehelper', 'display_name': '文件传输助手'}
 DEFAULT_WECHAT_APP = '/Applications/WeChat.app'
+
+
+def personal_id(value):
+    return isinstance(value, str) and USER_ID.fullmatch(value) and not value.lower().startswith('gh_')
 
 
 def client_app_path(value):
@@ -120,6 +126,9 @@ class BridgeHTTP:
                     if isinstance(reason, str) and reason in messages:
                         code, message = messages[reason]
                         raise AppError(code, message, 503)
+                if response.status == 503 and path == '/notifier/contacts':
+                    raise AppError('CONTACT_LOOKUP_UNAVAILABLE',
+                                   '暂时无法读取本机联系人，请检查微信登录和原生通讯录连接。', 503)
                 raise AppError('BRIDGE_RESPONSE_INVALID', '发送桥请求未成功，请检查原生桥运行状态。', 503)
             data = json.loads(raw)
             if not isinstance(data, dict) or data.get('status') != 'ok':
@@ -180,7 +189,7 @@ class NativeDriver:
                       'wechat_version': version, 'wechat_build': build, 'checks': checks,
                       'ready': all(c['ok'] for c in checks), 'checked_at': time.time(),
                       'note': '通过微信内部发送通道提交文本，不操作聊天窗口、键盘、鼠标或剪贴板。'
-                              '“已提交微信”表示本地任务提交成功，群内结果仍可用通知编号核对。'}
+                              '“已提交微信”表示本地任务提交成功，可在对应会话用通知编号核对结果。'}
             self._health, self._health_at = result, time.monotonic()
             return result
 
@@ -214,7 +223,62 @@ class NativeDriver:
                  '_account_id': status['account_id']} for row in rows
                 if query.casefold() in row['group_name'].casefold() or query == row['group_id']][:20]
 
+    @staticmethod
+    def require_private_support(status):
+        if status.get('private_send_enabled') is not True:
+            raise AppError('PRIVATE_UNSUPPORTED', '当前原生发送桥需要升级后才能发送个人通知。', 503)
+
+    def _contacts(self, status, query, exact=False):
+        reply = self.transport.request('POST', '/notifier/contacts', {
+            'query': query, 'exact': exact, 'allow_contact_lookup': True,
+            'account_id': status['account_id'], 'session_id': status['session_id'],
+        }).get('data', {})
+        if (not isinstance(reply, dict) or reply.get('account_id') != status['account_id']
+                or reply.get('session_id') != status['session_id']):
+            raise AppError('ACCOUNT_CHANGED', '查询联系人期间微信账号或进程变化，请重新搜索。')
+        rows = reply.get('contacts')
+        if not isinstance(rows, list) or len(rows) > 20:
+            raise AppError('CONTACT_DIRECTORY_INVALID', '发送桥未返回有效联系人结果。', 503)
+        seen = set()
+        for row in rows:
+            if (not isinstance(row, dict) or not personal_id(row.get('user_id'))
+                    or row['user_id'] in seen or (exact and row['user_id'] != query)
+                    or not isinstance(row.get('display_name'), str)
+                    or not 1 <= len(row['display_name']) <= 200 or not row['display_name'].strip()):
+                raise AppError('CONTACT_DIRECTORY_INVALID', '联系人身份无法核对，请重新搜索。', 503)
+            seen.add(row['user_id'])
+        return rows
+
+    def search_person(self, query, allow_contact_lookup=False):
+        builtin = query.casefold() in (FILE_HELPER['user_id'], FILE_HELPER['display_name'])
+        if not builtin and not allow_contact_lookup:
+            raise AppError('CONTACT_LOOKUP_CONSENT_REQUIRED', '请先勾选允许本机查找微信联系人。', 422)
+        status = self._status()
+        self.require_private_support(status)
+        rows = [FILE_HELPER] if builtin else self._contacts(status, query)
+        return [{'group_name': row['display_name'], 'user_id': row['user_id'],
+                 'selection_source': 'native_directory', 'requires_id_confirmation': True,
+                 '_account_id': status['account_id'], '_session_id': status['session_id'],
+                 '_contact_lookup': not builtin} for row in rows]
+
+    def _verify_person(self, row, confirmed):
+        if not confirmed:
+            raise AppError('PRIVATE_CONFIRMATION_REQUIRED', '请核对收件人和唯一微信 ID。')
+        status = self._status()
+        self.require_private_support(status)
+        if status['account_id'] != row['_account_id'] or status['session_id'] != row['_session_id']:
+            raise AppError('ACCOUNT_CHANGED', '微信账号或进程已变化，请重新搜索联系人。')
+        user_id = row['user_id']
+        # Only candidates created by an authorized search can re-read contact.db.
+        matches = self._contacts(status, user_id, exact=True) if row['_contact_lookup'] else [FILE_HELPER]
+        if len(matches) != 1 or matches[0]['user_id'] != user_id or matches[0]['display_name'] != row['group_name']:
+            raise AppError('CONTACT_CHANGED', '联系人信息已变化，请重新搜索并核对。')
+        return {'group_name': row['group_name'], 'backend': self.backend,
+                'user_id': user_id, 'account_id': status['account_id']}
+
     def verify_candidate(self, row, confirmed):
+        if row.get('user_id'):
+            return self._verify_person(row, confirmed)
         if not confirmed:
             raise AppError('GROUP_CONFIRMATION_REQUIRED', '请核对群名和唯一群 ID，再确认绑定。')
         status = self._status()
@@ -231,10 +295,17 @@ class NativeDriver:
         status = self._status()
         if status.get('ready') is not True:
             raise AppError('NATIVE_NOT_READY', '原生发送上下文尚未就绪，任务已保留。', 503, retryable=True)
-        if (task.get('backend') != self.backend or not GROUP_ID.fullmatch(task.get('group_id', ''))
-                or task.get('account_id') != status['account_id']):
-            raise AppError('TARGET_IDENTITY_CHANGED', '任务的接收群 ID 或微信账号与当前绑定不一致。')
-        self._prepared = {'task_id': task['id'], 'request_id': task.get('dispatch_nonce') or task['id'], 'group_id': task['group_id'],
+        group_id, user_id = task.get('group_id', ''), task.get('user_id', '')
+        if user_id and not group_id and personal_id(user_id):
+            self.require_private_support(status)
+            recipient = {'user_id': user_id}
+        elif group_id and not user_id and GROUP_ID.fullmatch(group_id):
+            recipient = {'group_id': group_id}
+        else:
+            raise AppError('TARGET_IDENTITY_CHANGED', '任务的收件人 ID 无效。')
+        if task.get('backend') != self.backend or task.get('account_id') != status['account_id']:
+            raise AppError('TARGET_IDENTITY_CHANGED', '任务绑定的微信账号或发送方式已变化。')
+        self._prepared = {'task_id': task['id'], 'request_id': task.get('dispatch_nonce') or task['id'], **recipient,
                           'account_id': status['account_id'], 'session_id': status['session_id'],
                           'message_hash': hashlib.sha256(task['message'].encode()).hexdigest()}
         return 'prepared'
@@ -250,5 +321,5 @@ class NativeDriver:
         payload = {k: v for k, v in prepared.items() if k not in ('message_hash', 'task_id')}
         reply = self.transport.request('POST', '/notifier/submit', {**payload, 'text': task['message']})
         if reply.get('receipt') != 'submitted' or reply.get('request_id') != prepared['request_id']:
-            raise AppError('RESULT_UNKNOWN', '原生发送结果无法确认，请在群中核对通知编号。')
+            raise AppError('RESULT_UNKNOWN', '原生发送结果无法确认，请在对应会话核对通知编号。')
         return 'submitted'

@@ -1,4 +1,5 @@
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
@@ -32,14 +33,16 @@ class Notification(Model):
 
 class Search(Model):
     query: str = Field(min_length=1, max_length=100)
+    recipient_type: Literal['group', 'private'] = 'group'
+    allow_contact_lookup: StrictBool = False
 
     @field_validator('query')
     @classmethod
     def not_blank(cls, value):
         if not value.strip():
-            raise ValueError('请填写群名')
+            raise ValueError('请填写搜索内容')
         if re.search(r'[\x00-\x1f\x7f]', value):
-            raise ValueError('群名不能包含控制字符')
+            raise ValueError('搜索内容不能包含控制字符')
         return value.strip()
 
 

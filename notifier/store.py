@@ -50,7 +50,7 @@ class Store:
             # Additive migration: keep existing queue/history and recipient snapshots.
             for table in ('targets', 'tasks'):
                 columns = {r['name'] for r in db.execute('PRAGMA table_info(' + table + ')')}
-                for name, default in (('backend', 'visual'), ('group_id', ''), ('account_id', '')):
+                for name, default in (('backend', 'visual'), ('group_id', ''), ('account_id', ''), ('user_id', '')):
                     if name not in columns:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
                 if table == 'tasks' and 'dispatch_nonce' not in columns:
@@ -98,7 +98,7 @@ class Store:
                 state = 'unknown' if row['status'] == 'dispatching' else 'failed'
                 code = 'PROCESS_INTERRUPTED'
                 db.execute('UPDATE tasks SET status=?,error_code=?,error_message=?,updated_at=? WHERE id=?',
-                           (state, code, '进程中断，请核对任务与微信群后处理。', time.time(), row['id']))
+                           (state, code, '进程中断，请核对任务与对应微信会话后处理。', time.time(), row['id']))
                 self.event(db, row['id'], state, code)
             if rows:
                 db.execute("UPDATE settings SET value='false' WHERE key='dispatch_enabled'")
@@ -107,21 +107,23 @@ class Store:
         with self.connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM targets ORDER BY active DESC,verified_at DESC')]
 
-    def bind(self, code, label, group_name, mode, backend='visual', group_id='', account_id=''):
+    def bind(self, code, label, group_name, mode, backend='visual', group_id='', account_id='', user_id=''):
+        # group_name is also the recipient name for private targets, for API compatibility.
         with self.connect() as db:
             try:
                 db.execute('''INSERT INTO targets(code,label,group_name,revision,mode,active,verified_at,
-                              backend,group_id,account_id) VALUES (?,?,?,?,?,1,?,?,?,?)''',
-                           (code, label, group_name, uuid.uuid4().hex, mode, time.time(), backend, group_id, account_id))
+                              backend,group_id,account_id,user_id) VALUES (?,?,?,?,?,1,?,?,?,?,?)''',
+                           (code, label, group_name, uuid.uuid4().hex, mode, time.time(),
+                            backend, group_id, account_id, user_id))
             except sqlite3.IntegrityError:
-                raise AppError('TARGET_EXISTS', '群标识已存在，请使用新的标识，已有任务的目标不会被替换。') from None
+                raise AppError('TARGET_EXISTS', '目标标识已存在，请使用新的标识，已有任务的目标不会被替换。') from None
         return next(item for item in self.targets() if item['code'] == code)
 
     def disable_target(self, code):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             if not db.execute('UPDATE targets SET active=0 WHERE code=?', (code,)).rowcount:
-                raise AppError('NOT_FOUND', '目标群不存在', 404)
+                raise AppError('NOT_FOUND', '通知目标不存在', 404)
             rows = db.execute("SELECT id FROM tasks WHERE target_code=? AND status='pending'", (code,)).fetchall()
             for row in rows:
                 db.execute("UPDATE tasks SET status='cancelled',updated_at=?,error_code='TARGET_DISABLED' WHERE id=?", (time.time(), row['id']))
@@ -142,7 +144,7 @@ class Store:
                 return dict(previous), True
             target = db.execute('SELECT * FROM targets WHERE code=? AND active=1', (request.target_code,)).fetchone()
             if not target:
-                raise AppError('TARGET_UNAVAILABLE', '请先绑定可用的通知群。', 422)
+                raise AppError('TARGET_UNAVAILABLE', '请先绑定可用的通知目标。', 422)
             pending = db.execute("SELECT COUNT(*) FROM tasks WHERE status IN ('pending','preparing','dispatching')").fetchone()[0]
             if pending >= self.settings(db)['max_pending']:
                 raise AppError('QUEUE_FULL', '待发送队列已满，请稍后重试。', 429)
@@ -150,11 +152,11 @@ class Store:
             marker = 'WN-' + task_id[:12].upper()
             message = ((request.title + '\n\n') if request.title else '') + request.body + '\n\n通知编号：' + marker
             db.execute('''INSERT INTO tasks(id,event_id,origin,target_code,target_revision,group_name,
-                title,body,message,fingerprint,status,created_at,updated_at,expires_at,next_due,backend,group_id,account_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?)''',
+                title,body,message,fingerprint,status,created_at,updated_at,expires_at,next_due,backend,group_id,account_id,user_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?,?,?,?)''',
                 (task_id, request.event_id, origin, target['code'], target['revision'], target['group_name'],
                  request.title, request.body, message, digest, now, now, now + request.expires_in_seconds, now,
-                 target['backend'], target['group_id'], target['account_id']))
+                 target['backend'], target['group_id'], target['account_id'], target['user_id']))
             self.event(db, task_id, 'pending')
         return self.get(task_id), False
 
@@ -186,6 +188,11 @@ class Store:
             counts = {r['status']: r['n'] for r in db.execute(count_sql, (origin,) if origin else ())}
         return {'items': [dict(r) for r in rows], 'total': total, 'counts': counts, 'page': page, 'limit': limit}
 
+    @staticmethod
+    def target_matches(target, task):
+        return (target is not None and target['active'] and target['revision'] == task['target_revision']
+                and all(target[key] == task[key] for key in ('backend', 'group_id', 'user_id', 'account_id')))
+
     def claim(self, mode, backend='visual'):
         now = time.time()
         with self.connect() as db:
@@ -201,10 +208,8 @@ class Store:
             if not row:
                 return None
             target = db.execute('SELECT * FROM targets WHERE code=?', (row['target_code'],)).fetchone()
-            if (not target or not target['active'] or target['revision'] != row['target_revision'] or target['mode'] != mode
-                    or target['backend'] != backend or row['backend'] != backend
-                    or target['group_id'] != row['group_id'] or target['account_id'] != row['account_id']):
-                db.execute("UPDATE tasks SET status='failed',error_code='TARGET_CHANGED',error_message='目标群已停用或运行模式变化，请重新绑定并提交。',updated_at=? WHERE id=?", (now, row['id']))
+            if not self.target_matches(target, row) or target['mode'] != mode or row['backend'] != backend:
+                db.execute("UPDATE tasks SET status='failed',error_code='TARGET_CHANGED',error_message='目标已停用或绑定已变化，请重新绑定并提交。',updated_at=? WHERE id=?", (now, row['id']))
                 self.event(db, row['id'], 'failed', 'TARGET_CHANGED')
                 return None
             db.execute("UPDATE tasks SET status='preparing',attempts=attempts+1,updated_at=?,error_code=NULL,error_message=NULL WHERE id=?", (now, row['id']))
@@ -225,8 +230,8 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             target = db.execute('SELECT * FROM targets WHERE code=?', (row['target_code'],)).fetchone()
-            if (not self.settings(db)['dispatch_enabled'] or not target['active']
-                    or target['revision'] != row['target_revision'] or row['expires_at'] <= time.time()):
+            if (not self.settings(db)['dispatch_enabled'] or not self.target_matches(target, row)
+                    or row['expires_at'] <= time.time()):
                 return False
             stamp = time.time()
             db.execute("UPDATE tasks SET status='dispatching',dispatch_at=?,updated_at=? WHERE id=?", (stamp, stamp, task_id))
@@ -263,12 +268,12 @@ class Store:
                 if row['status'] not in ('failed', 'unknown'):
                     raise AppError('INVALID_STATE', '只有失败或结果未知的任务可以重试。')
                 if row['status'] == 'unknown' and not checked:
-                    raise AppError('CHECK_REQUIRED', '先到群里核对通知编号，确认未发送后才能重试。')
+                    raise AppError('CHECK_REQUIRED', '先在对应微信会话核对通知编号，确认未发送后才能重试。')
                 if row['expires_at'] <= time.time():
                     raise AppError('EXPIRED', '任务已过期，请使用新事件编号重新提交。')
                 target = db.execute('SELECT * FROM targets WHERE code=?', (row['target_code'],)).fetchone()
-                if not target or not target['active'] or target['revision'] != row['target_revision']:
-                    raise AppError('TARGET_CHANGED', '原目标群不可用，请重新提交。')
+                if not self.target_matches(target, row):
+                    raise AppError('TARGET_CHANGED', '原通知目标不可用，请重新提交。')
                 status = 'pending'
             db.execute('UPDATE tasks SET status=?,updated_at=?,next_due=?,attempts=0,error_code=NULL,error_message=NULL,dispatch_nonce=? WHERE id=?',
                        (status, time.time(), time.time(), uuid.uuid4().hex, task_id))

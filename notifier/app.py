@@ -43,7 +43,7 @@ def create_app(directory, driver=None, start_worker=True):
             worker.close()
             lock.release()
 
-    app = FastAPI(title='个人微信群通知', version='1.2.0', lifespan=lifespan,
+    app = FastAPI(title='个人微信通知', version='1.2.0', lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store, app.state.credentials = store, credentials
     app.state.worker, app.state.controller = worker, controller
@@ -77,8 +77,9 @@ def create_app(directory, driver=None, start_worker=True):
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
         fields = ['.'.join(map(str, error['loc'][1:])) for error in exc.errors()]
-        names = {'body': '通知内容', 'title': '标题', 'event_id': '事件编号', 'target_code': '目标群标识',
-                 'expires_in_seconds': '有效期', 'query': '群名', 'label': '显示名称', 'code': '群标识',
+        names = {'body': '通知内容', 'title': '标题', 'event_id': '事件编号', 'target_code': '目标标识',
+                 'expires_in_seconds': '有效期', 'query': '搜索内容', 'label': '显示名称', 'code': '目标标识',
+                 'recipient_type': '目标类型', 'allow_contact_lookup': '联系人查询授权',
                  'interval_seconds': '发送间隔', 'max_pending': '队列上限'}
         message = '请检查：' + '、'.join(dict.fromkeys(names.get(field, field) for field in fields)) + '。'
         return JSONResponse({'error': {'code': 'VALIDATION_ERROR', 'message': message, 'fields': fields}}, status_code=422)
@@ -148,7 +149,7 @@ def create_app(directory, driver=None, start_worker=True):
             active = [t for t in store.targets() if t['active'] and t['mode'] == controller.driver.mode
                       and t['backend'] == getattr(controller.driver, 'backend', 'visual')]
             if not active:
-                raise AppError('NO_TARGET', '请先绑定当前运行模式的目标群。')
+                raise AppError('NO_TARGET', '请先绑定当前运行模式的通知目标。')
             if not controller.driver.health(fresh=True)['ready']:
                 raise AppError('WECHAT_NOT_READY', '微信未就绪，请先查看连接设置。', 503)
         result = store.update_settings(values)
@@ -164,7 +165,7 @@ def create_app(directory, driver=None, start_worker=True):
 
     @app.post('/api/v1/targets/search', dependencies=[Depends(admin)])
     def target_search(payload: Search):
-        return {'items': controller.search(payload.query)}
+        return {'items': controller.search(payload.query, payload.recipient_type, payload.allow_contact_lookup)}
 
     @app.post('/api/v1/targets/bind', dependencies=[Depends(admin)])
     def target_bind(payload: Bind):

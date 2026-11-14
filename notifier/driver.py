@@ -371,6 +371,9 @@ class DryRunDriver:
     def search(self, query):
         return [{'group_name': query.strip()}]
 
+    def search_person(self, query, allow_contact_lookup=False):
+        return [{'group_name': query, 'user_id': 'wxid_rehearsal'}]
+
     def verify_group(self, name):
         return name
 
@@ -398,10 +401,16 @@ class Controller:
         finally:
             self.lock.release()
 
-    def search(self, query):
+    def search(self, query, recipient_type='group', allow_contact_lookup=False):
         with self.exclusive():
             self.candidates.clear()
-            rows = self.driver.search(query.strip())
+            if recipient_type == 'private':
+                search_person = getattr(self.driver, 'search_person', None)
+                if search_person is None:
+                    raise AppError('PRIVATE_UNSUPPORTED', '个人通知需要原生发送桥。', 422)
+                rows = search_person(query.strip(), allow_contact_lookup)
+            else:
+                rows = self.driver.search(query.strip())
             response = []
             for row in rows[:20]:
                 key = uuid.uuid4().hex
@@ -413,10 +422,17 @@ class Controller:
         with self.exclusive():
             entry = self.candidates.get(request.candidate_id)
             if not entry or time.monotonic() > entry[1]:
-                raise AppError('CANDIDATE_EXPIRED', '群候选已过期，请重新搜索。')
+                raise AppError('CANDIDATE_EXPIRED', '候选已过期，请重新搜索。')
             if entry[2].get('selection_source') == 'native_directory':
                 binding = self.driver.verify_candidate(entry[2], request.confirmed_visual)
                 target = store.bind(request.code, request.label.strip(), mode=self.driver.mode, **binding)
+                del self.candidates[request.candidate_id]
+                return target
+            if entry[2].get('user_id'):
+                if not request.confirmed_visual:
+                    raise AppError('PRIVATE_CONFIRMATION_REQUIRED', '请核对收件人和唯一微信 ID。')
+                target = store.bind(request.code, request.label.strip(), entry[0], self.driver.mode,
+                                    user_id=entry[2]['user_id'])
                 del self.candidates[request.candidate_id]
                 return target
             if entry[2].get('_visual_profile'):

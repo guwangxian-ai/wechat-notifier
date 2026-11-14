@@ -12,12 +12,14 @@ import (
 func notifierFixture(t *testing.T) {
 	t.Helper()
 	oldStatus, oldDirectory, oldEnqueue, oldToken, oldKeyStatus := notifierStatusReader, notifierDirectoryReader, notifierEnqueue, config.OnebotToken, notifierKeyStatusReader
+	oldContacts := notifierContactsReader
 	t.Cleanup(func() {
 		notifierStatusReader = oldStatus
 		notifierDirectoryReader = oldDirectory
 		notifierEnqueue = oldEnqueue
 		config.OnebotToken = oldToken
 		notifierKeyStatusReader = oldKeyStatus
+		notifierContactsReader = oldContacts
 	})
 	config.OnebotToken = "test-token-only-not-a-real-secret"
 	notifierReceipts.items = make(map[string]*notifierReceipt)
@@ -156,5 +158,82 @@ func TestNotifierRejectsAccountAndSessionChange(t *testing.T) {
 		if w.Code != 409 {
 			t.Fatal(w.Code)
 		}
+	}
+}
+
+func TestNotifierContactLookupRequiresConsentAndCurrentSession(t *testing.T) {
+	notifierFixture(t)
+	reads := 0
+	notifierContactsReader = func(query string, exact bool) ([]notifierContact, error) {
+		reads++
+		if query != "wxid_private" || !exact {
+			t.Fatal("unexpected lookup")
+		}
+		return []notifierContact{{UserID: "wxid_private", DisplayName: "测试联系人"}}, nil
+	}
+	for _, test := range []struct {
+		allowed bool
+		session string
+		token   string
+		status  int
+	}{
+		{false, "session-test", config.OnebotToken, 400},
+		{true, "old-session", config.OnebotToken, 409},
+		{true, "session-test", "", 401},
+		{true, "session-test", config.OnebotToken, 200},
+	} {
+		body, _ := json.Marshal(map[string]any{"query": "wxid_private", "exact": true,
+			"allow_contact_lookup": test.allowed, "session_id": test.session, "account_id": "wxid_test"})
+		r := httptest.NewRequest("POST", "/notifier/contacts", strings.NewReader(string(body)))
+		r.Header.Set("Authorization", "Bearer "+test.token)
+		w := httptest.NewRecorder()
+		notifierContactsHandler(w, r)
+		if w.Code != test.status {
+			t.Fatal(w.Code, w.Body.String())
+		}
+		if test.status == 200 && !strings.Contains(w.Body.String(), `"user_id":"wxid_private"`) {
+			t.Fatal(w.Body.String())
+		}
+	}
+	if reads != 1 {
+		t.Fatal("unexpected contact reads", reads)
+	}
+}
+
+func TestNotifierSubmitPrivateUsesOnlyUserID(t *testing.T) {
+	notifierFixture(t)
+	calls := 0
+	notifierEnqueue = func(message *SendMsg) error {
+		calls++
+		if message.UserId != "wxid_private" || message.GroupID != "" || message.Type != "text" {
+			t.Fatal("unexpected recipient")
+		}
+		return nil
+	}
+	for _, test := range []struct {
+		groupID, userID string
+		status          int
+	}{
+		{"123@chatroom", "wxid_private", 400},
+		{"", "", 400},
+		{"", "123@chatroom", 400},
+		{"", "gh_public", 400},
+		{"", "wxid_private", 200},
+		{"", "wxid_private", 200},
+		{"", "wxid_other", 409},
+	} {
+		request := notifierSubmission{RequestID: strings.Repeat("c", 32), GroupID: test.groupID, UserID: test.userID,
+			AccountID: "wxid_test", SessionID: "session-test", Text: "测试"}
+		body, _ := json.Marshal(request)
+		r := httptest.NewRequest("POST", "/notifier/submit", strings.NewReader(string(body)))
+		r.Header.Set("Authorization", "Bearer "+config.OnebotToken)
+		w := httptest.NewRecorder()
+		notifierSubmitHandler(w, r)
+		if w.Code != test.status {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	if calls != 1 {
+		t.Fatal("unexpected enqueue count", calls)
 	}
 }

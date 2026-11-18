@@ -63,7 +63,7 @@ class Worker:
                 dispatched = True
                 status = self.controller.driver.send(task)
                 if status not in ('observed', 'simulated', 'submitted'):
-                    raise AppError('RESULT_UNKNOWN', '微信发送结果无法确认，请核对群内通知编号。')
+                    raise AppError('RESULT_UNKNOWN', '微信发送结果无法确认，请在对应会话核对通知编号。')
                 self.store.finish(task['id'], status)
                 return True
         except AppError as exc:

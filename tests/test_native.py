@@ -22,9 +22,11 @@ class BridgeFixture:
     def __init__(self):
         self.state = {'protocol': PROTOCOL, 'upstream_commit': UPSTREAM_COMMIT,
                       'version': '4.1.15.55', 'build': '270135', 'account_id': 'wxid_test',
-                      'session_id': 'test-session', 'ready': True}
+                      'session_id': 'test-session', 'ready': True, 'private_send_enabled': True}
         self.groups = [{'group_id': '100@chatroom', 'group_name': '测试通知群✅'},
                        {'group_id': '200@chatroom', 'group_name': '测试通知群✅'}]
+        self.contacts = [{'user_id': 'wxid_one', 'display_name': '同名联系人'},
+                         {'user_id': 'wxid_two', 'display_name': '同名联系人'}]
         self.calls, self.failure, self.bad_receipt = [], False, False
 
     def request(self, method, path, payload=None):
@@ -35,6 +37,10 @@ class BridgeFixture:
             return {'status': 'ok', 'data': copy.deepcopy(self.state)}
         if path == '/notifier/groups':
             return {'status': 'ok', 'data': {**self.state, 'groups': copy.deepcopy(self.groups)}}
+        if path == '/notifier/contacts':
+            assert payload['allow_contact_lookup'] is True
+            rows = [row for row in self.contacts if not payload['exact'] or row['user_id'] == payload['query']]
+            return {'status': 'ok', 'data': {**self.state, 'contacts': copy.deepcopy(rows)}}
         if path == '/notifier/submit':
             return {'status': 'ok', 'receipt': 'observed' if self.bad_receipt else 'submitted',
                     'request_id': payload['request_id']}
@@ -196,6 +202,73 @@ class NativeTests(unittest.TestCase):
             self.assertTrue(config.json()['has_token'])
             self.assertNotIn('private-bridge-secret', config.text)
             self.assertEqual(client.get('/api/v1/native/connection').status_code, 401)
+
+    def test_private_api_binds_selected_id_and_deduplicates_submission(self):
+        app = create_app(self.temp.name, self.driver, start_worker=False)
+        with TestClient(app, base_url='http://127.0.0.1') as client:
+            admin = {'Authorization': 'Bearer ' + app.state.credentials.admin}
+            ingest = {'Authorization': 'Bearer ' + app.state.credentials.ingest}
+            search = {'query': '同名联系人', 'recipient_type': 'private'}
+            response = client.post('/api/v1/targets/search', json=search, headers=admin)
+            self.assertEqual(response.json()['error']['code'], 'CONTACT_LOOKUP_CONSENT_REQUIRED')
+            self.assertEqual(self.bridge.calls, [])
+            search['allow_contact_lookup'] = True
+            self.assertEqual(client.post('/api/v1/targets/search', json=search, headers=ingest).status_code, 403)
+            rows = client.post('/api/v1/targets/search', json=search, headers=admin).json()['items']
+            self.assertEqual([row['user_id'] for row in rows], ['wxid_one', 'wxid_two'])
+            self.assertNotIn('_account_id', rows[1])
+            binding = {'candidate_id': rows[1]['candidate_id'], 'code': 'personal', 'label': '个人通知'}
+            response = client.post('/api/v1/targets/bind', json=binding, headers=admin)
+            self.assertEqual(response.json()['error']['code'], 'PRIVATE_CONFIRMATION_REQUIRED')
+            response = client.post('/api/v1/targets/bind', json={**binding, 'confirmed_visual': True}, headers=admin)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual((response.json()['user_id'], response.json()['group_id']), ('wxid_two', ''))
+            self.assertEqual(self.bridge.calls[-1][2]['query'], 'wxid_two')
+            self.assertTrue(self.bridge.calls[-1][2]['exact'])
+            notice = {'event_id': 'private:1', 'target_code': 'personal', 'body': '新线索'}
+            accepted = client.post('/api/v1/notifications', json=notice, headers=ingest)
+            duplicate = client.post('/api/v1/notifications', json=notice, headers=ingest)
+            self.assertEqual((accepted.status_code, duplicate.status_code), (202, 200))
+            task_id = accepted.json()['task_id']
+            self.assertEqual(duplicate.json()['task_id'], task_id)
+            self.assertTrue(app.state.worker.tick())
+            self.assertEqual(self.store.get(task_id)['status'], 'submitted')
+            sends = [payload for _, path, payload in self.bridge.calls if path == '/notifier/submit']
+            self.assertEqual(len(sends), 1)
+            self.assertEqual(sends[0]['user_id'], 'wxid_two')
+            self.assertNotIn('group_id', sends[0])
+
+    def test_private_candidate_cannot_cross_sessions_or_rebind_deleted_contact(self):
+        row = self.driver.search_person('同名联系人', allow_contact_lookup=True)[0]
+        self.bridge.state['session_id'] = 'next-session'
+        with self.assertRaises(AppError) as err:
+            self.driver.verify_candidate(row, True)
+        self.assertEqual(err.exception.code, 'ACCOUNT_CHANGED')
+        self.bridge.state['session_id'] = 'test-session'
+        self.bridge.contacts.pop(0)
+        with self.assertRaises(AppError) as err:
+            self.driver.verify_candidate(row, True)
+        self.assertEqual(err.exception.code, 'CONTACT_CHANGED')
+
+    def test_filehelper_does_not_read_contact_directory(self):
+        row = self.driver.search_person('文件传输助手')[0]
+        binding = self.driver.verify_candidate(row, True)
+        self.assertEqual(binding['user_id'], 'filehelper')
+        self.assertTrue(all(path == '/notifier/status' for _, path, _ in self.bridge.calls))
+        self.bridge.state.pop('private_send_enabled')
+        with self.assertRaises(AppError) as err:
+            self.driver.search_person('文件传输助手')
+        self.assertEqual(err.exception.code, 'PRIVATE_UNSUPPORTED')
+
+    def test_private_task_rejects_changed_bound_id(self):
+        self.store.bind('personal', '个人通知', '联系人', 'live', backend='onebot',
+                        user_id='wxid_one', account_id='wxid_test')
+        task, _ = self.store.enqueue(Notification(event_id='private:1', target_code='personal', body='正文'), 'admin')
+        with self.store.connect() as db:
+            db.execute("UPDATE targets SET user_id='wxid_two' WHERE code='personal'")
+        self.assertFalse(self.worker.tick())
+        self.assertEqual(self.store.get(task['id'])['error_code'], 'TARGET_CHANGED')
+        self.assertFalse(any(path == '/notifier/submit' for _, path, _ in self.bridge.calls))
 
 
 class ConfigAndTransportTests(unittest.TestCase):

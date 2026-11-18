@@ -8,13 +8,12 @@
 
 本仓库通过本机 HTTP 与独立 Go 桥通信，没有复制上游 SwiftUI AI 应用、模型、TTS 或对外回调业务。适配范围：
 
-- 增加鉴权的状态、群目录和文字提交接口；按账号、桥进程和请求编号核对。
-- 仅启用通知所需的文本 R3 和已授权群目录 Hook，跳过入站聊天与媒体 Hook。
-- 群目录只返回群名和群 ID，不返回好友或群成员。
+- 提供鉴权的状态、目标查询和文字提交接口。群聊与私聊分别按唯一 ID 提交，核对账号、桥进程和请求编号。
+- 仅启用文本 R3 和目标查询所需的目录 Hook。群目录返回群名和群 ID，个人搜索按单次授权返回匹配的联系人名称和 ID。
 - 仅回环监听，Gadget 使用独立 Token；私密缓存留在本机。
 - 不确定结果不自动重发，日志隐藏凭证并限制轮转大小。
 
-`scripts/prepare_native_bridge.py` 可从固定上游版本重现修改；差异保存在 `integrations/gusion/upstream.patch`。新增的 `notifier.go`、测试和 `contact_compat.js` 使用兼容的 GPL-3.0 许可。
+`scripts/prepare_native_bridge.py` 可从固定上游版本重现修改。差异保存在 `integrations/gusion/upstream.patch`，适配代码与测试遵循 GPL-3.0 许可。个人搜索使用 SQLite 参数绑定。 [Frida JavaScript API](https://frida.re/docs/javascript-api/#database)
 
 `scripts/package_native_bridge.py` 同时输出运行归档及该构建对应的修改后源码。公开 Git 仓库不包含二进制构建缓存或运行资料；另行分发桥二进制时应一并提供对应源码、许可证和上游声明。
 
